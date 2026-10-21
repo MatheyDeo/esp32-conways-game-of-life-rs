@@ -9,17 +9,17 @@ license = "MIT OR Apache-2.0"
 [workspace]
 
 [dependencies]
-esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "86508e8ad9563883e3a7fec14730a6c89569cb54", features = ["esp32s31", "unstable"] }
-esp-backtrace = {git = "https://github.com/esp-rs/esp-hal.git", rev = "86508e8ad9563883e3a7fec14730a6c89569cb54", features = [
+esp-hal = { git = "https://github.com/esp-rs/esp-hal.git", rev = "08cad7187f840171341fb8249c8a07b07316b559", features = ["esp32s31", "unstable"] }
+esp-backtrace = {git = "https://github.com/esp-rs/esp-hal.git", rev = "08cad7187f840171341fb8249c8a07b07316b559", features = [
     "panic-handler",
     "println"
 ] }
-esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal.git", rev = "86508e8ad9563883e3a7fec14730a6c89569cb54", features = ["esp32s31"] }
-esp-println = { git = "https://github.com/esp-rs/esp-hal.git", rev = "86508e8ad9563883e3a7fec14730a6c89569cb54", features = ["log-04"] }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal.git", rev = "08cad7187f840171341fb8249c8a07b07316b559", features = ["esp32s31"] }
+esp-println = { git = "https://github.com/esp-rs/esp-hal.git", rev = "08cad7187f840171341fb8249c8a07b07316b559", features = ["log-04"] }
 log = { version = "0.4.29" }
 
 #######esp-alloc = "0.10.0"
-esp-alloc = {git = "https://github.com/esp-rs/esp-hal.git", rev = "86508e8ad9563883e3a7fec14730a6c89569cb54", features = ["esp32s31"]}
+esp-alloc = {git = "https://github.com/esp-rs/esp-hal.git", rev = "08cad7187f840171341fb8249c8a07b07316b559", features = ["esp32s31"]}
 
 embedded-graphics = "0.8.2"
 embedded-hal = "1.0.0"

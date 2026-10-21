@@ -3,766 +3,465 @@
 
 extern crate alloc;
 
-// ESP-IDF App Descriptor required by newer espflash
-esp_bootloader_esp_idf::esp_app_desc!();
-use alloc::boxed::Box;
-use bevy_ecs::prelude::*;
-use embedded_graphics::{
-    Drawable,
-    pixelcolor::Rgb565,
-    prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
-};
-use embedded_graphics_framebuf::FrameBuf;
-use embedded_graphics_framebuf::backends::FrameBufferBackend;
-use esp_hal::clock::CpuClock::_240MHz;
-use esp_hal::delay::Delay;
-use esp_hal::dma::{
-    CHUNK_SIZE,
-    DmaDescriptor,
-    DmaTxBuf,
-    aligned::{DmaAlignedMut, InternalMemory},
-};
+use alloc::{boxed::Box, vec};
 
-use esp_hal::i2c::{self, master::I2c};
-use esp_hal::lcd_cam::{
-    LcdCam,
-    lcd::{
-        ClockMode, Phase, Polarity,
-        dpi::{Config, Dpi, Format, FrameTiming},
-    },
-};
-use esp_hal::psram::Psram;
 use esp_hal::{
-    Blocking,
+    clock::CpuClock,
+    delay::Delay,
+    dma::{
+        DmaDescriptor, DmaTxBuf, ExternalBurstConfig,
+        aligned::{DmaAlignedMut, InternalMemory},
+    },
     gpio::{Level, Output, OutputConfig},
+    lcd_cam::{
+        LcdCam,
+        lcd::{
+            ClockMode, Phase, Polarity,
+            dpi::{Config, Dpi, Format, FrameTiming},
+        },
+    },
     main,
-    peripherals::Peripherals,
+    psram::Psram,
     rng::Rng,
     time::Rate,
 };
-use esp_println::logger::init_logger_from_env;
+
 use esp_println::println;
-use log::{error, info};
-/* ////////////////////////////////////OLD PANIC HANDLER
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    error!("Panic: {_info}");
-    loop {}
-}
-*/
+
+esp_bootloader_esp_idf::esp_app_desc!();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    esp_println::println!("PANIC: {}", info);
+    println!("PANIC: {}", info);
 
     loop {
         core::hint::spin_loop();
     }
 }
 
+// -----------------------------------------------------------------------------
+// Display
+// -----------------------------------------------------------------------------
 
+const LCD_WIDTH: usize = 800;
+const LCD_HEIGHT: usize = 480;
+const FRAME_BYTES: usize = LCD_WIDTH * LCD_HEIGHT * 2;
 
-// --- DISPLAY CONFIGURATION ---
-const LCD_H_RES: u16 = 480;
-const LCD_V_RES: u16 = 480;
-const BUFFER_SIZE: usize = LCD_H_RES as usize * LCD_V_RES as usize;
+const HSYNC_WIDTH: usize = 4;
+const H_BACK_PORCH: usize = 8;
+const H_FRONT_PORCH: usize = 8;
 
-// --- Game of Life Definitions ---
-const GRID_WIDTH: usize = 70;
-const GRID_HEIGHT: usize = 70;
+const VSYNC_WIDTH: usize = 4;
+const V_BACK_PORCH: usize = 8;
+const V_FRONT_PORCH: usize = 8;
 
-// Define the I2C expander struct (based on working code)
-struct Tca9554 {
-    i2c: I2c<'static, Blocking>,
-    address: u8,
-}
+const DMA_ALIGNMENT: usize = 64;
 
-impl Tca9554 {
-    pub fn new(i2c: I2c<'static, Blocking>) -> Self {
-        Self { i2c, address: 0x20 }
-    }
+// Conservative maximum descriptor chunk for 64-byte alignment.
+const DESCRIPTOR_CHUNK: usize = 4096 - DMA_ALIGNMENT;
+const DESCRIPTOR_COUNT: usize = FRAME_BYTES.div_ceil(DESCRIPTOR_CHUNK);
 
-    pub fn write_direction_reg(&mut self, value: u8) -> Result<(), i2c::master::Error> {
-        self.i2c.write(self.address, &[0x03, value])
-    }
-
-    pub fn write_output_reg(&mut self, value: u8) -> Result<(), i2c::master::Error> {
-        self.i2c.write(self.address, &[0x01, value])
-    }
-}
-
-// Define initialization commands
-#[derive(Copy, Clone)]
-enum InitCmd {
-    Cmd(u8, &'static [u8]),
-    Delay(u8),
-}
-
-// Initialization commands for the display controller
-const INIT_CMDS: &[InitCmd] = &[
-    InitCmd::Cmd(0xf0, &[0x55, 0xaa, 0x52, 0x08, 0x00]),
-    InitCmd::Cmd(0xf6, &[0x5a, 0x87]),
-    InitCmd::Cmd(0xc1, &[0x3f]),
-    InitCmd::Cmd(0xc2, &[0x0e]),
-    InitCmd::Cmd(0xc6, &[0xf8]),
-    InitCmd::Cmd(0xc9, &[0x10]),
-    InitCmd::Cmd(0xcd, &[0x25]),
-    InitCmd::Cmd(0xf8, &[0x8a]),
-    InitCmd::Cmd(0xac, &[0x45]),
-    InitCmd::Cmd(0xa0, &[0xdd]),
-    InitCmd::Cmd(0xa7, &[0x47]),
-    InitCmd::Cmd(0xfa, &[0x00, 0x00, 0x00, 0x04]),
-    InitCmd::Cmd(0x86, &[0x99, 0xa3, 0xa3, 0x51]),
-    InitCmd::Cmd(0xa3, &[0xee]),
-    InitCmd::Cmd(0xfd, &[0x3c, 0x3]),
-    InitCmd::Cmd(0x71, &[0x48]),
-    InitCmd::Cmd(0x72, &[0x48]),
-    InitCmd::Cmd(0x73, &[0x00, 0x44]),
-    InitCmd::Cmd(0x97, &[0xee]),
-    InitCmd::Cmd(0x83, &[0x93]),
-    InitCmd::Cmd(0x9a, &[0x72]),
-    InitCmd::Cmd(0x9b, &[0x5a]),
-    InitCmd::Cmd(0x82, &[0x2c, 0x2c]),
-    InitCmd::Cmd(0xB1, &[0x10]),
-    InitCmd::Cmd(
-        0x6d,
-        &[
-            0x00, 0x1f, 0x19, 0x1a, 0x10, 0x0e, 0x0c, 0x0a, 0x02, 0x07, 0x1e, 0x1e, 0x1e, 0x1e,
-            0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x08, 0x01, 0x09, 0x0b, 0x0d, 0x0f,
-            0x1a, 0x19, 0x1f, 0x00,
-        ],
-    ),
-    InitCmd::Cmd(
-        0x64,
-        &[
-            0x38, 0x05, 0x01, 0xdb, 0x03, 0x03, 0x38, 0x04, 0x01, 0xdc, 0x03, 0x03, 0x7a, 0x7a,
-            0x7a, 0x7a,
-        ],
-    ),
-    InitCmd::Cmd(
-        0x65,
-        &[
-            0x38, 0x03, 0x01, 0xdd, 0x03, 0x03, 0x38, 0x02, 0x01, 0xde, 0x03, 0x03, 0x7a, 0x7a,
-            0x7a, 0x7a,
-        ],
-    ),
-    InitCmd::Cmd(
-        0x66,
-        &[
-            0x38, 0x01, 0x01, 0xdf, 0x03, 0x03, 0x38, 0x00, 0x01, 0xe0, 0x03, 0x03, 0x7a, 0x7a,
-            0x7a, 0x7a,
-        ],
-    ),
-    InitCmd::Cmd(
-        0x67,
-        &[
-            0x30, 0x01, 0x01, 0xe1, 0x03, 0x03, 0x30, 0x02, 0x01, 0xe2, 0x03, 0x03, 0x7a, 0x7a,
-            0x7a, 0x7a,
-        ],
-    ),
-    InitCmd::Cmd(
-        0x68,
-        &[
-            0x00, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a, 0x08, 0x15, 0x08, 0x15, 0x7a, 0x7a,
-        ],
-    ),
-    InitCmd::Cmd(0x60, &[0x38, 0x08, 0x7a, 0x7a, 0x38, 0x09, 0x7a, 0x7a]),
-    InitCmd::Cmd(0x63, &[0x31, 0xe4, 0x7a, 0x7a, 0x31, 0xe5, 0x7a, 0x7a]),
-    InitCmd::Cmd(0x69, &[0x04, 0x22, 0x14, 0x22, 0x14, 0x22, 0x08]),
-    InitCmd::Cmd(0x6b, &[0x07]),
-    InitCmd::Cmd(0x7a, &[0x08, 0x13]),
-    InitCmd::Cmd(0x7b, &[0x08, 0x13]),
-    InitCmd::Cmd(
-        0xd1,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(
-        0xd2,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(
-        0xd3,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(
-        0xd4,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(
-        0xd5,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(
-        0xd6,
-        &[
-            0x00, 0x00, 0x00, 0x04, 0x00, 0x12, 0x00, 0x18, 0x00, 0x21, 0x00, 0x2a, 0x00, 0x35,
-            0x00, 0x47, 0x00, 0x56, 0x00, 0x90, 0x00, 0xe5, 0x01, 0x68, 0x01, 0xd5, 0x01, 0xd7,
-            0x02, 0x36, 0x02, 0xa6, 0x02, 0xee, 0x03, 0x48, 0x03, 0xa0, 0x03, 0xba, 0x03, 0xc5,
-            0x03, 0xd0, 0x03, 0xe0, 0x03, 0xea, 0x03, 0xfa, 0x03, 0xff,
-        ],
-    ),
-    InitCmd::Cmd(0x36, &[0x00]),
-    InitCmd::Cmd(0x2A, &[0x00, 0x00, 0x01, 0xDF]), // 0 to 479 (0x1DF)
-    // Set full row address range
-    InitCmd::Cmd(0x2B, &[0x00, 0x00, 0x01, 0xDF]), // 0 to 479 (0x1DF)
-    InitCmd::Cmd(0x3A, &[0x66]),
-    InitCmd::Cmd(0x11, &[]),
-    InitCmd::Delay(120),
-    InitCmd::Cmd(0x29, &[]),
-    InitCmd::Delay(20),
-];
-
-/// A wrapper around a boxed array that implements FrameBufferBackend.
-pub struct HeapBuffer<C: PixelColor, const N: usize>(Box<[C; N]>);
-
-impl<C: PixelColor, const N: usize> HeapBuffer<C, N> {
-    pub fn new(data: Box<[C; N]>) -> Self {
-        Self(data)
-    }
-
-    pub fn as_slice(&self) -> &[C] {
-        self.0.as_ref()
-    }
-}
-
-impl<C: PixelColor, const N: usize> core::ops::Deref for HeapBuffer<C, N> {
-    type Target = [C; N];
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<C: PixelColor, const N: usize> core::ops::DerefMut for HeapBuffer<C, N> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<C: PixelColor, const N: usize> FrameBufferBackend for HeapBuffer<C, N> {
-    type Color = C;
-    fn set(&mut self, index: usize, color: Self::Color) {
-        self.0[index] = color;
-    }
-    fn get(&self, index: usize) -> Self::Color {
-        self.0[index]
-    }
-    fn nr_elements(&self) -> usize {
-        N
-    }
-}
-
-fn randomize_grid(rng: &mut Rng, grid: &mut [[u8; GRID_WIDTH]; GRID_HEIGHT]) {
-    for row in grid.iter_mut() {
-        for cell in row.iter_mut() {
-            let mut buf = [0u8; 1];
-            rng.read(&mut buf);
-            // Randomly set cell to 1 (alive) or 0 (dead)
-            *cell = if buf[0] & 1 != 0 { 1 } else { 0 };
-        }
-    }
-}
-
-fn update_game_of_life(grid: &mut [[u8; GRID_WIDTH]; GRID_HEIGHT]) {
-    let mut new_grid = [[0u8; GRID_WIDTH]; GRID_HEIGHT];
-    for y in 0..GRID_HEIGHT {
-        for x in 0..GRID_WIDTH {
-            // Count neighbors: consider a cell alive if its age is >0.
-            let mut alive_neighbors = 0;
-            for i in 0..3 {
-                for j in 0..3 {
-                    if i == 1 && j == 1 {
-                        continue;
-                    }
-                    let nx = (x + i + GRID_WIDTH - 1) % GRID_WIDTH;
-                    let ny = (y + j + GRID_HEIGHT - 1) % GRID_HEIGHT;
-                    if grid[ny][nx] > 0 {
-                        alive_neighbors += 1;
-                    }
-                }
-            }
-            if grid[y][x] > 0 {
-                // Live cell survives if 2 or 3 neighbors; increment age.
-                if alive_neighbors == 2 || alive_neighbors == 3 {
-                    new_grid[y][x] = grid[y][x].saturating_add(1);
-                } else {
-                    new_grid[y][x] = 0;
-                }
-            } else {
-                // Dead cell becomes alive if exactly 3 neighbors.
-                if alive_neighbors == 3 {
-                    new_grid[y][x] = 1;
-                } else {
-                    new_grid[y][x] = 0;
-                }
-            }
-        }
-    }
-    *grid = new_grid;
-}
-
-/// Maps cell age (1..=max_age) to a color. Newborn cells are dark blue and older cells become brighter (toward white).
-fn age_to_color(age: u8) -> Rgb565 {
-    if age == 0 {
-        Rgb565::BLACK
-    } else {
-        let max_age = 10;
-        let a = age.min(max_age) as u32; // clamp age and use u32 for intermediate math
-        let r = ((31 * a) + 5) / max_age as u32;
-        let g = ((63 * a) + 5) / max_age as u32;
-        let b = 31; // Keep blue channel constant
-        // Convert back to u8 and return the color.
-        Rgb565::new(r as u8, g as u8, b)
-    }
-}
-
-/// Draws the game grid using the cell age for color.
-fn draw_grid<D: DrawTarget<Color = Rgb565>>(
-    display: &mut D,
-    grid: &[[u8; GRID_WIDTH]; GRID_HEIGHT],
-) -> Result<(), D::Error> {
-    let border_color = Rgb565::new(230, 230, 230);
-    for (y, row) in grid.iter().enumerate() {
-        for (x, &age) in row.iter().enumerate() {
-            let point = Point::new(x as i32 * 7, y as i32 * 7);
-            if age > 0 {
-                // Draw a border then fill with color based on age.
-                Rectangle::new(point, Size::new(7, 7))
-                .into_styled(PrimitiveStyle::with_fill(border_color))
-                .draw(display)?;
-            // Draw an inner cell with color according to age.
-            Rectangle::new(point + Point::new(1, 1), Size::new(5, 5))
-                    .into_styled(PrimitiveStyle::with_fill(age_to_color(age)))
-                    .draw(display)?;
-            } else {
-                // Draw a dead cell as black.
-                Rectangle::new(point, Size::new(7, 7))
-                .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-                .draw(display)?;
-        }
-        }
-    }
-    Ok(())
-}
-
-const LCD_BUFFER_SIZE: usize = 480 * 480;
-
-// Size of the entire frame in bytes (2 bytes per pixel)
-const FRAME_BYTES: usize = BUFFER_SIZE * 2;
-// Number of descriptors needed, each up to CHUNK_SIZE (4095)
-#[allow(clippy::manual_div_ceil)]
-const NUM_DMA_DESC: usize = (FRAME_BYTES + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-/// Place the descriptor(s) in DMA-capable RAM.
+// One ordinary, linear DMA descriptor array in internal memory.
 #[unsafe(link_section = ".dma")]
-static mut TX_DESCRIPTORS: InternalMemory<[DmaDescriptor; NUM_DMA_DESC]> =
-InternalMemory::new([DmaDescriptor::EMPTY; NUM_DMA_DESC]);
+static mut TX_DESCRIPTORS:
+    InternalMemory<[DmaDescriptor; DESCRIPTOR_COUNT]> =
+    InternalMemory::new([
+        DmaDescriptor::EMPTY;
+        DESCRIPTOR_COUNT
+    ]);
 
+// At approximately 61 Hz, three frames is about 49 ms.
+// Rendering adds some time between transfers.
+const FRAMES_PER_GENERATION: usize = 3;
 
-/*
+// -----------------------------------------------------------------------------
+// Allocate a 64-byte-aligned framebuffer from the PSRAM heap.
+// -----------------------------------------------------------------------------
+
+fn allocate_framebuffer() -> DmaAlignedMut<'static, [u8]> {
+    // Extra bytes let us align the start of the framebuffer.
+    // The allocation remains valid for the application's lifetime.
+    let allocation: &'static mut [u8] =
+        Box::leak(
+            vec![0u8; FRAME_BYTES + DMA_ALIGNMENT - 1]
+                .into_boxed_slice(),
+        );
+
+    let offset = allocation
+        .as_ptr()
+        .align_offset(DMA_ALIGNMENT);
+
+    assert!(offset < DMA_ALIGNMENT);
+
+    let pixels =
+        &mut allocation[offset..offset + FRAME_BYTES];
+
+    assert_eq!(pixels.as_ptr() as usize % DMA_ALIGNMENT, 0);
+    assert_eq!(pixels.len() % DMA_ALIGNMENT, 0);
+
+    DmaAlignedMut::new(pixels)
+        .expect("Framebuffer is not DMA-aligned")
+}
+
+// -----------------------------------------------------------------------------
+// Game of Life
+// -----------------------------------------------------------------------------
+
+const CELL_SIZE: usize = 8;
+const GRID_WIDTH: usize = LCD_WIDTH / CELL_SIZE;
+const GRID_HEIGHT: usize = LCD_HEIGHT / CELL_SIZE;
+const GRID_CELLS: usize = GRID_WIDTH * GRID_HEIGHT;
+
+fn randomize_grid(rng: &mut Rng, grid: &mut [u8]) {
+    rng.read(grid);
+
+    for cell in grid.iter_mut() {
+        *cell &= 1;
+    }
+}
+
+fn update_game_of_life(current: &[u8], next: &mut [u8]) {
+    for y in 0..GRID_HEIGHT {
+        let above = (y + GRID_HEIGHT - 1) % GRID_HEIGHT;
+        let below = (y + 1) % GRID_HEIGHT;
+
+        for x in 0..GRID_WIDTH {
+            let left = (x + GRID_WIDTH - 1) % GRID_WIDTH;
+            let right = (x + 1) % GRID_WIDTH;
+
+            let neighbors = [
+                above * GRID_WIDTH + left,
+                above * GRID_WIDTH + x,
+                above * GRID_WIDTH + right,
+                y * GRID_WIDTH + left,
+                y * GRID_WIDTH + right,
+                below * GRID_WIDTH + left,
+                below * GRID_WIDTH + x,
+                below * GRID_WIDTH + right,
+            ];
+
+            let alive_neighbors = neighbors
+                .iter()
+                .filter(|&&index| current[index] != 0)
+                .count();
+
+            let index = y * GRID_WIDTH + x;
+            let age = current[index];
+
+            next[index] = if age != 0 {
+                if alive_neighbors == 2 || alive_neighbors == 3 {
+                    age.saturating_add(1)
+                } else {
+                    0
+                }
+            } else if alive_neighbors == 3 {
+                1
+            } else {
+                0
+            };
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// RGB565 rendering
+// -----------------------------------------------------------------------------
+
+fn rgb565(r: u16, g: u16, b: u16) -> u16 {
+    (r << 11) | (g << 5) | b
+}
+
+fn age_to_color(age: u8) -> u16 {
+    if age == 0 {
+        return 0;
+    }
+
+    let age = u16::from(age.min(10));
+    let r = (31 * age + 5) / 10;
+    let g = (63 * age + 5) / 10;
+
+    rgb565(r, g, 31)
+}
+
+fn render_grid_pixels(pixels: &mut [u8], grid: &[u8]) {
+    assert!(CELL_SIZE >= 2);
+    assert_eq!(grid.len(), GRID_CELLS);
+    assert_eq!(GRID_WIDTH * CELL_SIZE, LCD_WIDTH);
+    assert_eq!(GRID_HEIGHT * CELL_SIZE, LCD_HEIGHT);
+    assert_eq!(pixels.len(), FRAME_BYTES);
+
+    const SCANLINE_BYTES: usize = LCD_WIDTH * 2;
+    const CELL_ROW_BYTES: usize = CELL_SIZE * 2;
+
+    let border_color = rgb565(28, 56, 28).to_le_bytes();
+
+    for cell_y in 0..GRID_HEIGHT {
+        let top_start = cell_y * CELL_SIZE * SCANLINE_BYTES;
+        let inner_start = top_start + SCANLINE_BYTES;
+
+        for cell_x in 0..GRID_WIDTH {
+            let age = grid[cell_y * GRID_WIDTH + cell_x];
+
+            let cell_offset = cell_x * CELL_ROW_BYTES;
+            let top_cell = top_start + cell_offset;
+            let inner_cell = inner_start + cell_offset;
+
+            if age == 0 {
+                pixels[top_cell..top_cell + CELL_ROW_BYTES].fill(0);
+                pixels[inner_cell..inner_cell + CELL_ROW_BYTES].fill(0);
+            } else {
+                let fill_color = age_to_color(age).to_le_bytes();
+
+                for pixel in pixels
+                    [top_cell..top_cell + CELL_ROW_BYTES]
+                    .chunks_exact_mut(2)
+                {
+                    pixel.copy_from_slice(&border_color);
+                }
+
+                for pixel in pixels
+                    [inner_cell..inner_cell + CELL_ROW_BYTES]
+                    .chunks_exact_mut(2)
+                {
+                    pixel.copy_from_slice(&fill_color);
+                }
+
+                // Left and right borders.
+                pixels[inner_cell..inner_cell + 2]
+                    .copy_from_slice(&border_color);
+
+                let right = inner_cell + CELL_ROW_BYTES - 2;
+                pixels[right..right + 2]
+                    .copy_from_slice(&border_color);
+            }
+        }
+
+        // Copy the interior scanline into the remaining interior rows.
+        for local_y in 2..CELL_SIZE - 1 {
+            let destination = top_start + local_y * SCANLINE_BYTES;
+
+            pixels.copy_within(
+                inner_start..inner_start + SCANLINE_BYTES,
+                destination,
+            );
+        }
+
+        // Copy the top border to the bottom border.
+        let bottom_start =
+            top_start + (CELL_SIZE - 1) * SCANLINE_BYTES;
+
+        pixels.copy_within(
+            top_start..top_start + SCANLINE_BYTES,
+            bottom_start,
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Application
+// -----------------------------------------------------------------------------
 
 #[main]
 fn main() -> ! {
+    let peripherals =
+        esp_hal::init(
+            esp_hal::Config::default()
+                .with_cpu_clock(CpuClock::_240MHz),
+        );
 
-    let peripherals: Peripherals =
-        esp_hal::init(esp_hal::Config::default().with_cpu_clock(_240MHz));
-        let psram = Psram::new(peripherals.PSRAM, Default::default());
+    println!("1: HAL initialized");
+
+    // Initialize the PSRAM heap before allocating the framebuffer.
+    let psram = Psram::new(peripherals.PSRAM, Default::default());
     esp_alloc::psram_allocator!(&psram);
-    init_logger_from_env();
-    
-    println!("Hello world");
-    
-    
-    
-    // Setup I2C for the d IO expander
-    // NOTE: Use GPIO8/18 for non-R16 modules or GPIO47/48 for R16 modules
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
+
+    println!("2: PSRAM allocator initialized");
+
+    let delay = Delay::new();
+
+    let mut lcd_disp = Output::new(
+        peripherals.GPIO38,
+        Level::Low,
+        OutputConfig::default(),
+    );
+
+    // Allow the display hardware to settle.
+    delay.delay_millis(100);
+
+    // Allocate one framebuffer in PSRAM.
+    let pixels = allocate_framebuffer();
+
+    println!("Framebuffer address: {:#010X}",
+        pixels.as_ptr() as usize);
+    println!("Framebuffer bytes: {}", pixels.len());
+
+    // Retrieve the single descriptor array.
+    let descriptors = unsafe {
+        (&mut *(&raw mut TX_DESCRIPTORS))
+            .get_mut()
+            .unsize()
+    };
+
+    // Use the HAL's ordinary linear DMA descriptor chain.
+    let mut dma_tx = DmaTxBuf::new_with_config(
+        descriptors,
+        pixels,
+        ExternalBurstConfig::Size64,
     )
-    .unwrap()
-    .with_sda(peripherals.GPIO47)
-    .with_scl(peripherals.GPIO48);
+    .expect("Failed to create DMA transmit buffer");
 
+    dma_tx.set_length(FRAME_BYTES);
 
+    println!("3: One PSRAM framebuffer and linear DMA buffer ready");
 
+    // Initialize the Game of Life grids.
+    let mut current =
+        vec![0u8; GRID_CELLS].into_boxed_slice();
 
+    let mut next =
+        vec![0u8; GRID_CELLS].into_boxed_slice();
 
-    
-// Direct LCD control pins on ESP32-S31-Korvo-1.
-// No I/O expander is needed.
-let mut lcd_cs = Output::new(
-    peripherals.GPIO38,
-    Level::High, // Display deselected
-    OutputConfig::default(),
-);
+    let mut rng = Rng::new();
+    randomize_grid(&mut rng, &mut current);
 
-let mut lcd_clk = Output::new(
-    peripherals.GPIO61,
-    Level::Low, // Clock idle low
-    OutputConfig::default(),
-);
+    // Draw the initial generation before the first DMA transfer.
+    render_grid_pixels(dma_tx.as_mut_slice(), &current);
 
-let mut lcd_mosi = Output::new(
-    peripherals.GPIO60,
-    Level::Low,
-    OutputConfig::default(),
-);
+    // -------------------------------------------------------------------------
+    // Configure the display. GPIOs and timing remain unchanged.
+    // -------------------------------------------------------------------------
 
-let delay = Delay::new();
-info!("Initializing display...");
-
-// Initial timing choice for bit-banging.
-// Verify against your display controller's timing requirements.
-const LCD_HALF_PERIOD_US: u32 = 1;
-
-// Send one command/data flag followed by eight bits, MSB first.
-// is_cmd = true  -> flag 0
-// is_cmd = false -> flag 1
-let mut write_byte = |b: u8, is_cmd: bool| {
-    // Select the display with the clock low.
-    lcd_clk.set_low();
-    lcd_cs.set_low();
-    delay.delay_micros(LCD_HALF_PERIOD_US);
-
-    for bit in core::iter::once(!is_cmd)
-        .chain((0..8).rev().map(|i| ((b >> i) & 1) != 0))
-    {
-        // Set data while the clock is low.
-        if bit {
-            lcd_mosi.set_high();
-        } else {
-            lcd_mosi.set_low();
-        }
-
-        // Allow data to settle before the rising clock edge.
-        delay.delay_micros(LCD_HALF_PERIOD_US);
-
-        lcd_clk.set_high();
-        delay.delay_micros(LCD_HALF_PERIOD_US);
-
-        lcd_clk.set_low();
-    }
-
-    // Complete the final clock pulse before releasing chip select.
-    delay.delay_micros(LCD_HALF_PERIOD_US);
-    lcd_cs.set_high();
-
-    // Return data to its idle level.
-    lcd_mosi.set_low();
-
-    // Leave a gap before another transfer.
-    delay.delay_micros(LCD_HALF_PERIOD_US);
-};
-
-
-
-
-
-
-    // VSYNC must be high during initialization
-    let mut vsync_pin = peripherals.GPIO45; //originally GPIO3
-    let vsync_must_be_high_during_setup =
-        Output::new(vsync_pin.reborrow(), Level::High, OutputConfig::default());
-
-    // Initialize the display by sending the initialization commands
-    for &init in INIT_CMDS.iter() {
-        match init {
-            InitCmd::Cmd(cmd, args) => {
-                write_byte(cmd, true);
-                for &arg in args {
-                    write_byte(arg, false);
-                }
-            }
-            InitCmd::Delay(ms) => {
-                delay.delay_millis(ms as _);
-            }
-        }
-    }
-    #[allow(clippy::drop_non_drop)]
-    drop(vsync_must_be_high_during_setup);
-
-
-    
-    
-    
-    
-    
-
-    // Set up DMA channel for LCD
-    let tx_channel = peripherals.DMA_AXI_CH2;
     let lcd_cam = LcdCam::new(peripherals.LCD_CAM);
-    
-    // Configure the RGB display
+
     let config = Config::default()
-    .with_clock_mode(ClockMode {
+        .with_frequency(Rate::from_mhz(25))
+        .with_clock_mode(ClockMode {
             polarity: Polarity::IdleLow,
-            phase: Phase::ShiftLow,
+            phase: Phase::ShiftHigh,
         })
-        .with_frequency(Rate::from_mhz(10))
         .with_format(Format {
             enable_2byte_mode: true,
             ..Default::default()
         })
         .with_timing(FrameTiming {
-            // active region
-            horizontal_active_width: 480,
-            vertical_active_height: 480,
-            // extend total timings for larger porch intervals
-            horizontal_total_width: 600, // allow long back/front porch
-            horizontal_blank_front_porch: 80,
-            vertical_total_height: 600, // allow longer vertical blank
-            vertical_blank_front_porch: 80,
-            // maintain sync widths
-            hsync_width: 10,
-            vsync_width: 4,
-            // place HSYNC pulse well before active data
-            hsync_position: 10,
+            horizontal_active_width: LCD_WIDTH,
+            horizontal_total_width:
+                HSYNC_WIDTH
+                    + H_BACK_PORCH
+                    + LCD_WIDTH
+                    + H_FRONT_PORCH,
+
+            horizontal_blank_front_porch:
+                HSYNC_WIDTH + H_BACK_PORCH,
+
+            vertical_active_height: LCD_HEIGHT,
+            vertical_total_height:
+                VSYNC_WIDTH
+                    + V_BACK_PORCH
+                    + LCD_HEIGHT
+                    + V_FRONT_PORCH,
+
+            vertical_blank_front_porch:
+                VSYNC_WIDTH + V_BACK_PORCH,
+
+            hsync_width: HSYNC_WIDTH,
+            vsync_width: VSYNC_WIDTH,
+            hsync_position: 0,
         })
         .with_vsync_idle_level(Level::High)
         .with_hsync_idle_level(Level::High)
         .with_de_idle_level(Level::Low)
         .with_disable_black_region(false);
-    
-    
 
+    let mut dpi = Dpi::new(
+        lcd_cam.lcd,
+        peripherals.DMA_AXI_CH2,
+        config,
+    )
+    .expect("Failed to configure RGB/DPI")
+    .with_vsync(peripherals.GPIO45)
+    .with_hsync(peripherals.GPIO44)
+    .with_de(peripherals.GPIO43)
+    .with_pclk(peripherals.GPIO40)
+    // Blue
+    .with_data0(peripherals.GPIO8)
+    .with_data1(peripherals.GPIO9)
+    .with_data2(peripherals.GPIO10)
+    .with_data3(peripherals.GPIO11)
+    .with_data4(peripherals.GPIO12)
+    // Green
+    .with_data5(peripherals.GPIO13)
+    .with_data6(peripherals.GPIO14)
+    .with_data7(peripherals.GPIO15)
+    .with_data8(peripherals.GPIO16)
+    .with_data9(peripherals.GPIO17)
+    .with_data10(peripherals.GPIO18)
+    // Red
+    .with_data11(peripherals.GPIO19)
+    .with_data12(peripherals.GPIO33)
+    .with_data13(peripherals.GPIO34)
+    .with_data14(peripherals.GPIO35)
+    .with_data15(peripherals.GPIO36);
 
+    println!("4: Display configured");
 
+    let mut display_enabled = false;
+    let mut frames_since_generation = 0usize;
 
-    /* /////////TRYING OUT DIFFERENT VALUES ACCORDING TO THE BSP
-    // Initialize the DPI interface with all the pins
-    let mut dpi = Dpi::new(lcd_cam.lcd, tx_channel, config)
-    .unwrap()
-        .with_vsync(vsync_pin.reborrow())
-        .with_hsync(peripherals.GPIO46)
-        .with_de(peripherals.GPIO17)
-        .with_pclk(peripherals.GPIO9)
-        // Blue
-        .with_data0(peripherals.GPIO10)
-        .with_data1(peripherals.GPIO11)
-        .with_data2(peripherals.GPIO12)
-        .with_data3(peripherals.GPIO13)
-        .with_data4(peripherals.GPIO14)
-        // Green
-        .with_data5(peripherals.GPIO21)
-        .with_data6(peripherals.GPIO8)
-        .with_data7(peripherals.GPIO18)
-        .with_data8(peripherals.GPIO45)
-        .with_data9(peripherals.GPIO38)
-        .with_data10(peripherals.GPIO39)
-        // Red
-        .with_data11(peripherals.GPIO40)
-        .with_data12(peripherals.GPIO41)
-        .with_data13(peripherals.GPIO42)
-        .with_data14(peripherals.GPIO2)
-        .with_data15(peripherals.GPIO1);
-    */
+    println!("Starting single-buffer frame loop");
 
-
-    // Initialize the DPI interface with all the pins
-    let mut dpi = Dpi::new(lcd_cam.lcd, tx_channel, config)
-        .unwrap()
-        .with_vsync(vsync_pin.reborrow())
-        .with_hsync(peripherals.GPIO44)
-        .with_de(peripherals.GPIO43)
-        .with_pclk(peripherals.GPIO40)
-        // Blue
-        .with_data0(peripherals.GPIO8)
-        .with_data1(peripherals.GPIO9)
-        .with_data2(peripherals.GPIO10)
-        .with_data3(peripherals.GPIO11)
-        .with_data4(peripherals.GPIO12)
-        // Green
-        .with_data5(peripherals.GPIO13)
-        .with_data6(peripherals.GPIO14)
-        .with_data7(peripherals.GPIO15)
-        .with_data8(peripherals.GPIO16)
-        .with_data9(peripherals.GPIO17)
-        .with_data10(peripherals.GPIO18)
-        // Red
-        .with_data11(peripherals.GPIO19)
-        .with_data12(peripherals.GPIO33)
-        .with_data13(peripherals.GPIO34)
-        .with_data14(peripherals.GPIO35)
-        .with_data15(peripherals.GPIO36);
-    
-    info!("Display initialized, starting game logic");
-
-
-
-    
-    
-    // Initialize Game of Life
-    let mut game_grid = [[0u8; GRID_WIDTH]; GRID_HEIGHT];
-    let mut rng = Rng::new();
-
-    // Initialize with random state
-    randomize_grid(&mut rng, &mut game_grid);
-    
-    // Create a framebuffer in RAM
-    let fb_data: Box<[Rgb565; LCD_BUFFER_SIZE]> = Box::new([Rgb565::BLACK; LCD_BUFFER_SIZE]);
-    let heap_buffer = HeapBuffer::new(fb_data);
-    let mut frame_buf = FrameBuf::new(heap_buffer, LCD_H_RES.into(), LCD_V_RES.into());
-    
-    // Draw initial screen (blue for testing)
-    frame_buf.clear(Rgb565::BLUE).unwrap();
-
-    // Initial transfer
-    
-    info!("Starting main loop");
-    
-    const FRAME_BYTES: usize = BUFFER_SIZE * 2;
-    let buf_box: Box<[u8; FRAME_BYTES]> = Box::new([0; FRAME_BYTES]);
-    // Box::leak turns it into a &'static mut [u8]
-    let psram_buf: &'static mut [u8] = Box::leak(buf_box);
-    
-    
-    /* ////////////replaced with following code
-    // Tie to descriptor set for one-shot DMA
-    let mut dma_tx: DmaTxBuf =
-    unsafe { DmaTxBuf::new(&mut TX_DESCRIPTORS[..], psram_buf).unwrap() };
-    */
-
-// SAFETY:
-// Execute this initialization exactly once.
-// No other code, interrupt, or core may access TX_DESCRIPTORS
-// after this exclusive reference is created.
-let descriptors: DmaAlignedMut<'static, [DmaDescriptor]> = unsafe {
-    let storage = &mut *(&raw mut TX_DESCRIPTORS);
-    storage.get_mut().unsize()
-};
-
-// psram_buf must be an exclusively owned &'static mut [u8].
-// This checks its memory region, address alignment, and byte length.
-let buffer: DmaAlignedMut<'static, [u8]> =
-    DmaAlignedMut::new(psram_buf)
-        .expect("PSRAM buffer has invalid DMA alignment");
-
-let mut dma_tx: DmaTxBuf =
-    DmaTxBuf::new(descriptors, buffer)
-        .expect("Failed to initialize DMA TX buffer");
-
-
-
-    ////////////////////////////////////////////////////// Main loop to draw the entire image
     loop {
-        update_game_of_life(&mut game_grid);
-        draw_grid(&mut frame_buf, &game_grid).unwrap();
-        
-        
-        // Pack entire frame into PSRAM DMA buffer
-        let dst = dma_tx.as_mut_slice();
-        for (i, px) in frame_buf.data.iter().enumerate() {
-            let [lo, hi] = px.into_storage().to_le_bytes();
-            dst[2 * i] = lo;
-            dst[2 * i + 1] = hi;
-        };
-        
-
-
-        // One-shot transfer
-        match dpi.send(false, dma_tx) {
-            Ok(xfer) => {
-                let (res, dpi2, buf2) = xfer.wait();
-                dpi = dpi2;
-                dma_tx = buf2;
-                if let Err(e) = res {
-                    error!("DMA error: {e:?}");
+        // Transfer exactly one frame. The buffer is moved into the transfer
+        // and returned to us when wait() finishes.
+        let transfer = match dpi.send(false, dma_tx) {
+            Ok(transfer) => {
+                if !display_enabled {
+                    lcd_disp.set_high();
+                    display_enabled = true;
                 }
+
+                transfer
             }
-            Err((e, dpi2, buf2)) => {
-                error!("DMA send error: {e:?}");
-                dpi = dpi2;
-                dma_tx = buf2;
+
+            Err((error, returned_dpi, returned_dma_tx)) => {
+                println!("LCD DMA send error: {:?}", error);
+
+                dpi = returned_dpi;
+                dma_tx = returned_dma_tx;
+
+                delay.delay_millis(10);
+                continue;
             }
+        };
+
+        let (result, returned_dpi, returned_dma_tx) =
+            transfer.wait();
+
+        dpi = returned_dpi;
+        dma_tx = returned_dma_tx;
+
+        if let Err(error) = result {
+            println!("LCD DMA transfer error: {:?}", error);
+            continue;
         }
 
+        frames_since_generation += 1;
 
+        if frames_since_generation >= FRAMES_PER_GENERATION {
+            // DMA has finished with this frame, so it is safe to modify
+            // the single framebuffer before starting another transfer.
+            update_game_of_life(&current, &mut next);
+            core::mem::swap(&mut current, &mut next);
 
+            render_grid_pixels(
+                dma_tx.as_mut_slice(),
+                &current,
+            );
 
-        
+            frames_since_generation = 0;
+        }
+
+        // The next iteration sends the buffer again. DmaTxBuf prepares
+        // the normal descriptor chain and writes back the pixel cache.
     }
 }
-*/
-
-    #[main]
-    fn main() -> ! {
-        
-    let peripherals: Peripherals =
-        esp_hal::init(esp_hal::Config::default().with_cpu_clock(_240MHz));
-        let psram = Psram::new(peripherals.PSRAM, Default::default());
-    esp_alloc::psram_allocator!(&psram);
-    init_logger_from_env();
-    
-    println!("Hello world");
-    
-    
-    
-    // Setup I2C for the d IO expander
-    // NOTE: Use GPIO8/18 for non-R16 modules or GPIO47/48 for R16 modules
-    let i2c = I2c::new(
-        peripherals.I2C0,
-        i2c::master::Config::default().with_frequency(Rate::from_khz(400)),
-    )
-    .unwrap()
-    .with_sda(peripherals.GPIO47)
-    .with_scl(peripherals.GPIO48);
-
-
-
-
-
-
-
-
-/*
-
-    let peripherals: Peripherals =
-    esp_hal::init(esp_hal::Config::default().with_cpu_clock(_240MHz));
-    let psram = Psram::new(peripherals.PSRAM, Default::default());
-    esp_alloc::psram_allocator!(&psram);
-    init_logger_from_env();
-
-    println!("Hello world");
-
-
-
-    */
-
-    // Small internal-RAM heap for this diagnostic test.
-    // Does not initialize or depend on PSRAM.
-   // esp_alloc::heap_allocator!(size: 32 * 1024);
-
-    let delay = esp_hal::delay::Delay::new();
-
-    loop {
-        esp_println::println!("Application is running");
-            delay.delay_millis(1000);
-        }
-    }
-    
