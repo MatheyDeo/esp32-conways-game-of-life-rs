@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-
 use esp_backtrace as _;
 use alloc::{boxed::Box, vec};
 use core::convert::Infallible;
@@ -39,7 +38,6 @@ use esp_hal::{
 use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
-
 
 // -----------------------------------------------------------------------------
 // Display
@@ -466,8 +464,7 @@ fn main() -> ! {
 
             if generation >= RESET_AFTER_GENERATIONS {
                 randomize_grid(&mut rng, &mut current);
-                
-                
+
                 generation = 0;
                 println!(
                     "Grid randomized after {} generations",

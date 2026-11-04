@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 
-embedded-graphics   = "0.8.2"
+embedded-graphics       = "0.8.2"
 esp-hal                 = {git = "https://github.com/esp-rs/esp-hal.git", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1", features = ["esp32s31",]}
 esp-backtrace           = {git = "https://github.com/esp-rs/esp-hal.git", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1", features = ["panic-handler","println"]}
 esp-bootloader-esp-idf  = {git = "https://github.com/esp-rs/esp-hal.git", rev = "8a70d09fe0065d5387dac82e4fbe937e95e496e1", features = ["esp32s31"] }
