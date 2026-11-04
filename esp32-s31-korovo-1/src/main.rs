@@ -3,18 +3,17 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
 
+use esp_backtrace as _;
+use alloc::{boxed::Box, vec};
 use core::convert::Infallible;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_10X20, MonoTextStyleBuilder},
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_10X20},
     pixelcolor::Rgb565,
     prelude::*,
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
-
-
 
 use esp_hal::{
     clock::CpuClock,
@@ -41,14 +40,6 @@ use esp_println::println;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("PANIC: {}", info);
-
-    loop {
-        core::hint::spin_loop();
-    }
-}
 
 // -----------------------------------------------------------------------------
 // Display
@@ -272,8 +263,7 @@ impl DrawTarget for FramebufferCanvas<'_> {
                 continue;
             }
 
-            let offset =
-                (point.y as usize * LCD_WIDTH + point.x as usize) * 2;
+            let offset = (point.y as usize * LCD_WIDTH + point.x as usize) * 2;
 
             let bytes = color.into_storage().to_le_bytes();
 
@@ -310,17 +300,10 @@ fn draw_generation_label(pixels: &mut [u8], generation: usize) {
         LCD_HEIGHT as i32 - 1 - MARGIN,
     );
 
-    Text::with_text_style(
-        &label,
-        position,
-        character_style,
-        text_style,
-    )
-    .draw(&mut canvas)
-    .unwrap();
+    Text::with_text_style(&label, position, character_style, text_style)
+        .draw(&mut canvas)
+        .unwrap();
 }
-
-
 
 // -----------------------------------------------------------------------------
 // Application
@@ -328,7 +311,7 @@ fn draw_generation_label(pixels: &mut [u8], generation: usize) {
 
 #[main]
 fn main() -> ! {
-    let mut generation: usize = 0;  
+    let mut generation: usize = 0;
 
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::_240MHz));
 
@@ -483,9 +466,13 @@ fn main() -> ! {
 
             if generation >= RESET_AFTER_GENERATIONS {
                 randomize_grid(&mut rng, &mut current);
-
+                
+                
                 generation = 0;
-                println!("Grid randomized after {} generations", RESET_AFTER_GENERATIONS);
+                println!(
+                    "Grid randomized after {} generations",
+                    RESET_AFTER_GENERATIONS
+                );
             } else {
                 update_game_of_life(&current, &mut next);
                 core::mem::swap(&mut current, &mut next);
