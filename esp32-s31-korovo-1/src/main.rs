@@ -107,6 +107,11 @@ fn randomize_grid(rng: &mut Rng, grid: &mut [u8]) {
     }
 }
 
+fn get_random_label_offset(rng: &mut Rng, v_offset: &mut i32, h_offset: &mut i32) {
+    *v_offset = (rng.random() % 15 + 5) as i32;
+    *h_offset = (rng.random() % 35 + 5) as i32;
+}
+
 fn update_game_of_life(current: &[u8], next: &mut [u8]) {
     for y in 0..GRID_HEIGHT {
         let above = (y + GRID_HEIGHT - 1) % GRID_HEIGHT;
@@ -272,7 +277,7 @@ impl DrawTarget for FramebufferCanvas<'_> {
     }
 }
 
-fn draw_generation_label(pixels: &mut [u8], generation: usize) {
+fn draw_generation_label(pixels: &mut [u8], generation: usize, offset_v:  i32,  offset_h: i32 ) {
     assert_eq!(pixels.len(), FRAME_BYTES);
 
     let mut canvas = FramebufferCanvas { pixels };
@@ -291,11 +296,9 @@ fn draw_generation_label(pixels: &mut [u8], generation: usize) {
         .baseline(Baseline::Bottom)
         .build();
 
-    const MARGIN: i32 = 6;
-
     let position = Point::new(
-        LCD_WIDTH as i32 - 1 - MARGIN,
-        LCD_HEIGHT as i32 - 1 - MARGIN,
+        LCD_WIDTH as i32 - offset_h,
+        LCD_HEIGHT as i32 - offset_v,
     );
 
     Text::with_text_style(&label, position, character_style, text_style)
@@ -351,7 +354,6 @@ fn main() -> ! {
 
     // Render a complete image first.
     render_grid_pixels(&mut render_buffer, &current);
-    draw_generation_label(&mut render_buffer, generation);
 
     // Then copy the finished image into the DMA framebuffer.
     // The data is already in little-endian RGB565 format.
@@ -419,6 +421,8 @@ fn main() -> ! {
 
     let mut display_enabled = false;
     let mut frames_since_generation = 0usize;
+    let mut label_offset_v: i32 = 20;
+    let mut label_offset_h: i32 = 40;
 
     loop {
         // The DMA framebuffer already contains a complete image.
@@ -459,26 +463,23 @@ fn main() -> ! {
 
         frames_since_generation += 1;
 
-        if frames_since_generation >= FRAMES_PER_GENERATION {
+        if frames_since_generation >= FRAMES_PER_GENERATION { //restart after 400 enerations (so it keeps being interesting)
             frames_since_generation = 0;
 
             if generation >= RESET_AFTER_GENERATIONS {
-                randomize_grid(&mut rng, &mut current);
-
                 generation = 0;
-                println!(
-                    "Grid randomized after {} generations",
-                    RESET_AFTER_GENERATIONS
-                );
-            } else {
+                get_random_label_offset(&mut rng, &mut label_offset_v, &mut label_offset_h);
+                randomize_grid(&mut rng, &mut current);
+                println!("Grid randomized after {} generations", RESET_AFTER_GENERATIONS );    
+            } 
+            else {
                 update_game_of_life(&current, &mut next);
                 core::mem::swap(&mut current, &mut next);
-
                 generation += 1;
             }
-
+            
             render_grid_pixels(&mut render_buffer, &current);
-            draw_generation_label(&mut render_buffer, generation);
+            draw_generation_label(&mut render_buffer, generation, label_offset_v, label_offset_h);
 
             // Publish the completed image to the DMA framebuffer.
             dma_tx.as_mut_slice().copy_from_slice(&render_buffer);
