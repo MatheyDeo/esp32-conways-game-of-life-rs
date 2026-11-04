@@ -108,8 +108,8 @@ fn randomize_grid(rng: &mut Rng, grid: &mut [u8]) {
 }
 
 fn get_random_label_offset(rng: &mut Rng, v_offset: &mut i32, h_offset: &mut i32) {
-    *v_offset = (rng.random() % 15 + 5) as i32;
-    *h_offset = (rng.random() % 35 + 5) as i32;
+    *v_offset = (rng.random() % 30) as i32;
+    *h_offset = (rng.random() % 50) as i32;
 }
 
 fn update_game_of_life(current: &[u8], next: &mut [u8]) {
@@ -283,11 +283,11 @@ fn draw_generation_label(pixels: &mut [u8], generation: usize, offset_v:  i32,  
     let mut canvas = FramebufferCanvas { pixels };
 
     // Three digits keep the label width constant for generations 0..400.
-    let label = alloc::format!("Generation: {:03}", generation);
+    let label = alloc::format!("Gen: {:03}", generation);
 
     let character_style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
-        .text_color(Rgb565::WHITE)
+        .text_color(Rgb565::new(30,61,30))
         .background_color(Rgb565::BLACK)
         .build();
 
@@ -421,8 +421,8 @@ fn main() -> ! {
 
     let mut display_enabled = false;
     let mut frames_since_generation = 0usize;
-    let mut label_offset_v: i32 = 20;
-    let mut label_offset_h: i32 = 40;
+    let mut label_offset_v: i32 = 30;
+    let mut label_offset_h: i32 = 50;
 
     loop {
         // The DMA framebuffer already contains a complete image.
